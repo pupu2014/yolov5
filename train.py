@@ -53,8 +53,8 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
     best = wdir / 'best.pt'
     results_file = save_dir / 'results.txt'
 
-    # Save run settings
-    with open(save_dir / 'hyp.yaml', 'w') as f:
+    # Save run settings,超参数，训练para
+    with open(log_dir / 'hyp.yaml', 'w') as f:
         yaml.dump(hyp, f, sort_keys=False)
     with open(save_dir / 'opt.yaml', 'w') as f:
         yaml.dump(vars(opt), f, sort_keys=False)
@@ -65,7 +65,7 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
     init_seeds(2 + rank)
     with open(opt.data) as f:
         data_dict = yaml.load(f, Loader=yaml.FullLoader)  # data dict
-    with torch_distributed_zero_first(rank):
+    with torch_distributed_zero_first(rank): # torch_distributed_zero_first同步所有进程
         check_dataset(data_dict)  # check
     train_path = data_dict['train']
     test_path = data_dict['val']
@@ -73,6 +73,8 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
     assert len(names) == nc, '%g names found for nc=%g dataset in %s' % (len(names), nc, opt.data)  # check
 
     # Model
+    # 所以这里主要是设定一个，如果加载预训练权重进行训练的话，就去除掉权重中的anchor，采用用户自定义的；
+    # 如果是resume的话，就是不去除anchor，就权重和anchor一起加载， 接着训练；
     pretrained = weights.endswith('.pt')
     if pretrained:
         with torch_distributed_zero_first(rank):
@@ -80,12 +82,14 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
         ckpt = torch.load(weights, map_location=device)  # load checkpoint
         if hyp.get('anchors'):
             ckpt['model'].yaml['anchors'] = round(hyp['anchors'])  # force autoanchor
-        model = Model(opt.cfg or ckpt['model'].yaml, ch=3, nc=nc).to(device)  # create
-        exclude = ['anchor'] if opt.cfg or hyp.get('anchors') else []  # exclude keys
+        model = Model(opt.cfg or ckpt['model'].yaml, ch=3, nc=nc).to(device)  # create resume时将opt.cfg设为空
+        exclude = ['anchor'] if opt.cfg or hyp.get('anchors') else []  # exclude keys 如果resume，则加载权重中保存的anchor来继续训练；
         state_dict = ckpt['model'].float().state_dict()  # to FP32
         state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  # intersect
         model.load_state_dict(state_dict, strict=False)  # load
-        logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  # report
+        logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  
+        # 显示加载预训练权重的的键值对和创建模型的键值对
+        # 如果设置了resume，则会少加载两个键值对(anchors,anchor_grid)
     else:
         model = Model(opt.cfg, ch=3, nc=nc).to(device)  # create
 
@@ -102,6 +106,7 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
     accumulate = max(round(nbs / total_batch_size), 1)  # accumulate loss before optimizing
     hyp['weight_decay'] *= total_batch_size * accumulate / nbs  # scale weight_decay
 
+    #将模型分成三组(weight、bn, bias, 其他所有参数)优化
     pg0, pg1, pg2 = [], [], []  # optimizer parameter groups
     for k, v in model.named_modules():
         if hasattr(v, 'bias') and isinstance(v.bias, nn.Parameter):
@@ -163,7 +168,7 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
     gs = int(max(model.stride))  # grid size (max stride)
     imgsz, imgsz_test = [check_img_size(x, gs) for x in opt.img_size]  # verify imgsz are gs-multiples
 
-    # DP mode
+    # DP mode DataParallel模式,仅支持单机多卡
     if cuda and rank == -1 and torch.cuda.device_count() > 1:
         model = torch.nn.DataParallel(model)
 
@@ -172,10 +177,12 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
         logger.info('Using SyncBatchNorm()')
 
-    # EMA
+    # Exponential moving average 为模型创建EMA指数滑动平均,如果GPU进程数大于1,则不创建
     ema = ModelEMA(model) if rank in [-1, 0] else None
 
-    # DDP mode
+    # DDP mode  
+    # 如果rank不等于-1,则使用DistributedDataParallel模式
+    # local_rank为gpu编号,rank为进程,例如rank=3，local_rank=0 表示第 3 个进程内的第 1 块 GPU。
     if cuda and rank != -1:
         model = DDP(model, device_ids=[opt.local_rank], output_device=opt.local_rank)
 
@@ -187,7 +194,10 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
     mlc = np.concatenate(dataset.labels, 0)[:, 0].max()  # max label class
     nb = len(dataloader)  # number of batches
     assert mlc < nc, 'Label class %g exceeds nc=%g in %s. Possible class labels are 0-%g' % (mlc, nc, opt.data, nc - 1)
-
+    """
+    获取标签中最大的类别值，并于类别数作比较
+    如果小于类别数则表示有问题
+    """
     # Process 0
     if rank in [-1, 0]:
         ema.updates = start_epoch * nb // accumulate  # set EMA updates
@@ -200,6 +210,7 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
             c = torch.tensor(labels[:, 0])  # classes
             # cf = torch.bincount(c.long(), minlength=nc) + 1.  # frequency
             # model._initialize_biases(cf.to(device))
+			# 根据上面的统计对所有样本的类别，中心点xy位置，长宽wh做可视化
             if plots:
                 plot_labels(labels, save_dir=save_dir)
                 if tb_writer:
@@ -207,7 +218,8 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
                 if wandb:
                     wandb.log({"Labels": [wandb.Image(str(x), caption=x.name) for x in save_dir.glob('*labels*.png')]})
 
-            # Anchors
+            #Anchors h/h_a, w/w_a都要在(1/hyp['anchor_t'], hyp['anchor_t'])是可以接受的
+            #如果标签框满足上面条件的数量小于总数的99%，则根据k-mean算法聚类新的锚点anchor
             if not opt.noautoanchor:
                 check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)
 
@@ -226,7 +238,7 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
     maps = np.zeros(nc)  # mAP per class
     results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
     scheduler.last_epoch = start_epoch - 1  # do not move
-    scaler = amp.GradScaler(enabled=cuda)
+    scaler = amp.GradScaler(enabled=cuda) # 通过torch1.6自带的api设置混合精度训练
     logger.info('Image sizes %g train, %g test\n'
                 'Using %g dataloader workers\nLogging results to %s\n'
                 'Starting training for %g epochs...' % (imgsz, imgsz_test, dataloader.num_workers, save_dir, epochs))
@@ -243,7 +255,7 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
             # Broadcast if DDP
             if rank != -1:
                 indices = (torch.tensor(dataset.indices) if rank == 0 else torch.zeros(dataset.n)).int()
-                dist.broadcast(indices, 0)
+                dist.broadcast(indices, 0) # 广播索引到其他group
                 if rank != 0:
                     dataset.indices = indices.cpu().numpy()
 
@@ -253,7 +265,9 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
 
         mloss = torch.zeros(4, device=device)  # mean losses
         if rank != -1:
-            dataloader.sampler.set_epoch(epoch)
+            dataloader.sampler.set_epoch(epoch)  
+            # DDP模式下打乱数据, ddp.sampler的随机采样数据是基于epoch+seed作为随机种子，
+            # 每次epoch不同，随机种子就不同
         pbar = enumerate(dataloader)
         logger.info(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'total', 'targets', 'img_size'))
         if rank in [-1, 0]:
@@ -270,6 +284,11 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
                 accumulate = max(1, np.interp(ni, xi, [1, nbs / total_batch_size]).round())
                 for j, x in enumerate(optimizer.param_groups):
                     # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
+                    """
+                    bias的学习率从0.1下降到基准学习率lr*lf(epoch)，
+                    其他的参数学习率从0增加到lr*lf(epoch).
+                    lf为上面设置的余弦退火的衰减函数
+                    """
                     x['lr'] = np.interp(ni, xi, [hyp['warmup_bias_lr'] if j == 2 else 0.0, x['initial_lr'] * lf(epoch)])
                     if 'momentum' in x:
                         x['momentum'] = np.interp(ni, xi, [hyp['warmup_momentum'], hyp['momentum']])
@@ -282,7 +301,7 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
                     ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]  # new shape (stretched to gs-multiple)
                     imgs = F.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
 
-            # Forward
+            # loss为总损失值，loss_items为一个元组，包含分类损失，objectness损失，框的回归损失和总损失
             with amp.autocast(enabled=cuda):
                 pred = model(imgs)  # forward
                 loss, loss_items = compute_loss(pred, targets.to(device), model)  # loss scaled by batch_size
@@ -292,7 +311,7 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
             # Backward
             scaler.scale(loss).backward()
 
-            # Optimize
+            # 模型反向传播accumulate次之后再根据累积的梯度更新一次参数
             if ni % accumulate == 0:
                 scaler.step(optimizer)  # optimizer.step
                 scaler.update()
@@ -382,7 +401,8 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
                 del ckpt
         # end epoch ----------------------------------------------------------------------------------------------------
     # end training
-
+    # 模型训练完后，strip_optimizer函数将optimizer从ckpt中去除；
+    # 并且对模型进行model.half(), 将Float32的模型->Float16，
     if rank in [-1, 0]:
         # Strip optimizers
         n = opt.name if opt.name.isnumeric() else ''
@@ -408,7 +428,7 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
     torch.cuda.empty_cache()
     return results
 
-
+#img-size： 训练和测试数据集的图片尺寸(个人理解为分辨率)，默认640，640nargs='+' 表示参数可设置一个或多个；
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--weights', type=str, default='yolov5s.pt', help='initial weights path')
@@ -448,13 +468,22 @@ if __name__ == '__main__':
     if opt.global_rank in [-1, 0]:
         check_git_status()
 
+    #这里模型创建，可通过opt.cfg，也可通过ckpt['model'].yaml
+    #这里的区别在于是否是resume，resume时会将opt.cfg设为空，
+    #则按照ckpt['model'].yaml创建模型；
+    #这也影响着下面是否除去anchor的key(也就是不加载anchor)，
+    #如果resume，则加载权重中保存的anchor来继续训练；
+    #主要是预训练权重里面保存了默认coco数据集对应的anchor，
+    #如果用户自定义了anchor，再加载预训练权重进行训练，会覆盖掉用户自定义的anchor；
+    #所以这里主要是设定一个，如果加载预训练权重进行训练的话，就去除掉权重中的anchor，采用用户自定义的；
+    #如果是resume的话，就是不去除anchor，就权重和anchor一起加载， 接着训练；
     # Resume
     if opt.resume:  # resume an interrupted run
         ckpt = opt.resume if isinstance(opt.resume, str) else get_latest_run()  # specified or most recent path
         assert os.path.isfile(ckpt), 'ERROR: --resume checkpoint does not exist'
         with open(Path(ckpt).parent.parent / 'opt.yaml') as f:
             opt = argparse.Namespace(**yaml.load(f, Loader=yaml.FullLoader))  # replace
-        opt.cfg, opt.weights, opt.resume = '', ckpt, True
+        opt.cfg, opt.weights, opt.resume = '', ckpt, True      # opt.cfg设置为'' 对应着train函数里面的操作(加载权重时是否加载权重里的anchor)
         logger.info('Resuming training from %s' % ckpt)
     else:
         # opt.hyp = opt.hyp or ('hyp.finetune.yaml' if opt.weights else 'hyp.scratch.yaml')
@@ -469,10 +498,10 @@ if __name__ == '__main__':
     if opt.local_rank != -1:
         assert torch.cuda.device_count() > opt.local_rank
         torch.cuda.set_device(opt.local_rank)
-        device = torch.device('cuda', opt.local_rank)
+        device = torch.device('cuda', opt.local_rank) # 根据gpu编号选择设备
         dist.init_process_group(backend='nccl', init_method='env://')  # distributed backend
         assert opt.batch_size % opt.world_size == 0, '--batch-size must be multiple of CUDA device count'
-        opt.batch_size = opt.total_batch_size // opt.world_size
+        opt.batch_size = opt.total_batch_size // opt.world_size  # 将总批次按照进程数分配给各个gpu
 
     # Hyperparameters
     with open(opt.hyp) as f:
@@ -484,8 +513,8 @@ if __name__ == '__main__':
 
     # Train
     logger.info(opt)
-    if not opt.evolve:
-        tb_writer = None  # init loggers
+    if not opt.evolve:# 如果不进行超参数进化，则直接调用train()函数，开始训练
+        tb_writer, wandb = None, None  # init loggers
         if opt.global_rank in [-1, 0]:
             logger.info(f'Start Tensorboard with "tensorboard --logdir {opt.project}", view at http://localhost:6006/')
             tb_writer = SummaryWriter(opt.save_dir)  # Tensorboard
@@ -530,6 +559,12 @@ if __name__ == '__main__':
         if opt.bucket:
             os.system('gsutil cp gs://%s/evolve.txt .' % opt.bucket)  # download evolve.txt if exists
 
+        #每个hyp和每个hyp的权重之后有两种进化方式；
+        # 1.根据每个hyp的权重随机选择一个之前的hyp作为base hyp，random.choices(range(n), weights=w)
+        # 2.根据每个hyp的权重对之前所有的hyp进行融合获得一个base hyp，(x * w.reshape(n, 1)).sum(0) / w.sum()
+        # evolve.txt会记录每次进化之后的results+hyp
+        # 每次进化时，hyp会根据之前的results进行从大到小的排序；
+        # 再根据fitness函数计算之前每次进化得到的hyp的权重
         for _ in range(300):  # generations to evolve
             if Path('evolve.txt').exists():  # if evolve.txt exists: select best hyps and mutate
                 # Select parent(s)
@@ -537,7 +572,8 @@ if __name__ == '__main__':
                 x = np.loadtxt('evolve.txt', ndmin=2)
                 n = min(5, len(x))  # number of previous results to consider
                 x = x[np.argsort(-fitness(x))][:n]  # top n mutations
-                w = fitness(x) - fitness(x).min()  # weights
+                w = fitness(x) - fitness(x).min()  # weights 根据results计算hyp的权重
+                # 根据不同进化方式获得base hyp
                 if parent == 'single' or len(x) == 1:
                     # x = x[random.randint(0, n - 1)]  # random selection
                     x = x[random.choices(range(n), weights=w)[0]]  # weighted selection
@@ -547,14 +583,15 @@ if __name__ == '__main__':
                 # Mutate
                 mp, s = 0.8, 0.2  # mutation probability, sigma
                 npr = np.random
-                npr.seed(int(time.time()))
+                npr.seed(int(time.time()))  # 获取突变初始值
                 g = np.array([x[0] for x in meta.values()])  # gains 0-1
                 ng = len(meta)
                 v = np.ones(ng)
                 while all(v == 1):  # mutate until a change occurs (prevent duplicates)
                     v = (g * (npr.random(ng) < mp) * npr.randn(ng) * npr.random() * s + 1).clip(0.3, 3.0)
+                # 将突变添加到base hyp上
                 for i, k in enumerate(hyp.keys()):  # plt.hist(v.ravel(), 300)
-                    hyp[k] = float(x[i + 7] * v[i])  # mutate
+                    hyp[k] = float(x[i + 7] * v[i])  # mutate # [i+7]是因为x中前七个数字为results的指标(P, R, mAP, F1, test_losses=(GIoU, obj, cls))，之后才是超参数hyp
 
             # Constrain to limits
             for k, v in meta.items():
@@ -565,6 +602,12 @@ if __name__ == '__main__':
             # Train mutation
             results = train(hyp.copy(), opt, device, wandb=wandb)
 
+            """
+            写入results和对应的hyp到evolve.txt
+            evolve.txt文件每一行为一次进化的结果
+            一行中前七个数字为(P, R, mAP, F1, test_losses=(GIoU, obj, cls))，之后为hyp
+            保存hyp到yaml文件
+            """
             # Write mutation results
             print_mutation(hyp.copy(), results, yaml_file, opt.bucket)
 

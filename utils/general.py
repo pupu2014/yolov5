@@ -346,7 +346,8 @@ def non_max_suppression(prediction, conf_thres=0.1, iou_thres=0.6, classes=None,
 
     return output
 
-
+#模型训练完后，strip_optimizer函数将optimizer从ckpt中去除；并且对模型进行model.half(), 将Float32的模型->Float16，
+#可以减少模型大小，提高inference速度
 def strip_optimizer(f='weights/best.pt', s=''):  # from utils.general import *; strip_optimizer()
     # Strip optimizer from 'f' to finalize training, optionally save as 's'
     x = torch.load(f, map_location=torch.device('cpu'))

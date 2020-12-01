@@ -66,10 +66,18 @@ def detect(save_img=False):
         if img.ndimension() == 3:
             img = img.unsqueeze(0)
 
+        #前向传播 返回pred的shape是(1, num_boxes, 5+num_class)
+        #num_boxes = h/32 * w/32 + h/16 * w/16 + h/8 * w/8
+        #pred[..., 0:4]为预测框坐标
+        #预测框坐标为xywh(中心点+宽长)格式
+        #pred[..., 4]为objectness置信度
+        #pred[..., 5:-1]为分类结果
         # Inference
         t1 = time_synchronized()
         pred = model(img, augment=opt.augment)[0]
-
+        #经过nms之后，预测框格式：xywh-->xyxy(左上角右下角)
+        #pred是一个列表list[torch.tensor]，长度为batch_size
+        #每一个torch.tensor的shape为(num_boxes, 6),内容为box+conf+cls
         # Apply NMS
         pred = non_max_suppression(pred, opt.conf_thres, opt.iou_thres, classes=opt.classes, agnostic=opt.agnostic_nms)
         t2 = time_synchronized()
@@ -92,7 +100,8 @@ def detect(save_img=False):
             if len(det):
                 # Rescale boxes from img_size to im0 size
                 det[:, :4] = scale_coords(img.shape[2:], det[:, :4], im0.shape).round()
-
+                # 调整预测框的坐标：基于resize+pad的图片的坐标-->基于原size图片的坐标
+                # 此时坐标格式为xyxy
                 # Print results
                 for c in det[:, -1].unique():
                     n = (det[:, -1] == c).sum()  # detections per class
@@ -100,6 +109,7 @@ def detect(save_img=False):
 
                 # Write results
                 for *xyxy, conf, cls in reversed(det):
+                    # # 将xyxy(左上角+右下角)格式转为xywh(中心点+宽长)格式，并除上w，h做归一化，转化为列表再保存
                     if save_txt:  # Write to file
                         xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
                         line = (cls, *xywh, conf) if opt.save_conf else (cls, *xywh)  # label format
@@ -142,7 +152,7 @@ def detect(save_img=False):
 
     print('Done. (%.3fs)' % (time.time() - t0))
 
-
+#agnostic-nms:进行nms是否也去除不同类别之间的框，默认False
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--weights', nargs='+', type=str, default='yolov5s.pt', help='model.pt path(s)')

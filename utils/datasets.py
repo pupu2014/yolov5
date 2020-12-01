@@ -417,7 +417,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 if maxi < 1:
                     shapes[i] = [maxi, 1]
                 elif mini > 1:
-                    shapes[i] = [1, 1 / mini]
+                    shapes[i] = [1, 1 / mini] #每个batch里的高宽比
 
             self.batch_shapes = np.ceil(np.array(shapes) * img_size / stride + pad).astype(np.int) * stride
 
@@ -615,7 +615,8 @@ def augment_hsv(img, hgain=0.5, sgain=0.5, vgain=0.5):
     #     for i in range(3):
     #         img[:, :, i] = cv2.equalizeHist(img[:, :, i])
 
-
+#x1a,y1a,x2a,y2a表示小图在大图中的位置（可以理解为小图在大图中的相对坐标），
+#x1b,y1b,x2b,y2b x1b,y1b,x2b,y2bx1b,y1b,x2b,y2b表示小图自己的绝对坐标
 def load_mosaic(self, index):
     # loads images in a mosaic
 
@@ -627,7 +628,7 @@ def load_mosaic(self, index):
         # Load image
         img, _, (h, w) = load_image(self, index)
 
-        # place img in img4
+        # place img in img4 设置大图上的位置（左上角）
         if i == 0:  # top left
             img4 = np.full((s * 2, s * 2, img.shape[2]), 114, dtype=np.uint8)  # base image with 4 tiles
             x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc  # xmin, ymin, xmax, ymax (large image)
@@ -645,7 +646,7 @@ def load_mosaic(self, index):
         img4[y1a:y2a, x1a:x2a] = img[y1b:y2b, x1b:x2b]  # img4[ymin:ymax, xmin:xmax]
         padw = x1a - x1b
         padh = y1a - y1b
-
+        # 计算小图到大图上时所产生的偏移，用来计算mosaic增强后的标签框的位置
         # Labels
         x = self.labels[index]
         labels = x.copy()
@@ -708,7 +709,7 @@ def letterbox(img, new_shape=(640, 640), color=(114, 114, 114), auto=True, scale
     dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]  # wh padding
     if auto:  # minimum rectangle
         dw, dh = np.mod(dw, 32), np.mod(dh, 32)  # wh padding
-    elif scaleFill:  # stretch
+    elif scaleFill:  # stretch如果scaleFill=True,则不进行填充，直接resize成img_size,任由图片进行拉伸和压缩
         dw, dh = 0.0, 0.0
         new_unpad = (new_shape[1], new_shape[0])
         ratio = new_shape[1] / shape[1], new_shape[0] / shape[0]  # width, height ratios
