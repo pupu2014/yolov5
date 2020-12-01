@@ -54,7 +54,7 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
     results_file = save_dir / 'results.txt'
 
     # Save run settings,超参数，训练para
-    with open(log_dir / 'hyp.yaml', 'w') as f:
+    with open(save_dir / 'hyp.yaml', 'w') as f:
         yaml.dump(hyp, f, sort_keys=False)
     with open(save_dir / 'opt.yaml', 'w') as f:
         yaml.dump(vars(opt), f, sort_keys=False)
@@ -514,7 +514,7 @@ if __name__ == '__main__':
     # Train
     logger.info(opt)
     if not opt.evolve:# 如果不进行超参数进化，则直接调用train()函数，开始训练
-        tb_writer, wandb = None, None  # init loggers
+        tb_writer = None  # init loggers
         if opt.global_rank in [-1, 0]:
             logger.info(f'Start Tensorboard with "tensorboard --logdir {opt.project}", view at http://localhost:6006/')
             tb_writer = SummaryWriter(opt.save_dir)  # Tensorboard
