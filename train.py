@@ -5,6 +5,7 @@ import os
 import random
 import time
 from pathlib import Path
+from threading import Thread
 from warnings import warn
 
 import numpy as np
@@ -21,6 +22,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 import test  # import test.py to get mAP after each epoch
+from models.experimental import attempt_load
 from models.yolo import Model
 from utils.autoanchor import check_anchors
 from utils.datasets import create_dataloader
@@ -139,6 +141,7 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
                                project='YOLOv5' if opt.project == 'runs/train' else Path(opt.project).stem,
                                name=save_dir.stem,
                                id=ckpt.get('wandb_id') if 'ckpt' in locals() else None)
+    loggers = {'wandb': wandb}  # loggers dict
 
     # Resume
     start_epoch, best_fitness = 0, 0.0
@@ -203,7 +206,7 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
         ema.updates = start_epoch * nb // accumulate  # set EMA updates
         testloader = create_dataloader(test_path, imgsz_test, total_batch_size, gs, opt,
                                        hyp=hyp, cache=opt.cache_images and not opt.notest, rect=True,
-                                       rank=-1, world_size=opt.world_size, workers=opt.workers)[0]  # testloader
+                                       rank=-1, world_size=opt.world_size, workers=opt.workers, pad=0.5)[0]
 
         if not opt.resume:
             labels = np.concatenate(dataset.labels, 0)
@@ -212,14 +215,11 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
             # model._initialize_biases(cf.to(device))
 			# 根据上面的统计对所有样本的类别，中心点xy位置，长宽wh做可视化
             if plots:
-                plot_labels(labels, save_dir=save_dir)
+                Thread(target=plot_labels, args=(labels, save_dir, loggers), daemon=True).start()
                 if tb_writer:
                     tb_writer.add_histogram('classes', c, 0)
-                if wandb:
-                    wandb.log({"Labels": [wandb.Image(str(x), caption=x.name) for x in save_dir.glob('*labels*.png')]})
 
-            #Anchors h/h_a, w/w_a都要在(1/hyp['anchor_t'], hyp['anchor_t'])是可以接受的
-            #如果标签框满足上面条件的数量小于总数的99%，则根据k-mean算法聚类新的锚点anchor
+            # Anchors
             if not opt.noautoanchor:
                 check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)
 
@@ -330,7 +330,7 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
                 # Plot
                 if plots and ni < 3:
                     f = save_dir / f'train_batch{ni}.jpg'  # filename
-                    plot_images(images=imgs, targets=targets, paths=paths, fname=f)
+                    Thread(target=plot_images, args=(imgs, targets, paths, f), daemon=True).start()
                     # if tb_writer:
                     #     tb_writer.add_image(f, result, dataformats='HWC', global_step=epoch)
                     #     tb_writer.add_graph(model, imgs)  # add model to tensorboard
@@ -405,15 +405,12 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
     # 并且对模型进行model.half(), 将Float32的模型->Float16，
     if rank in [-1, 0]:
         # Strip optimizers
-        n = opt.name if opt.name.isnumeric() else ''
-        fresults, flast, fbest = save_dir / f'results{n}.txt', wdir / f'last{n}.pt', wdir / f'best{n}.pt'
-        for f1, f2 in zip([wdir / 'last.pt', wdir / 'best.pt', results_file], [flast, fbest, fresults]):
-            if f1.exists():
-                os.rename(f1, f2)  # rename
-                if str(f2).endswith('.pt'):  # is *.pt
-                    strip_optimizer(f2)  # strip optimizer
-                    os.system('gsutil cp %s gs://%s/weights' % (f2, opt.bucket)) if opt.bucket else None  # upload
-        # Finish
+        for f in [last, best]:
+            if f.exists():  # is *.pt
+                strip_optimizer(f)  # strip optimizer
+                os.system('gsutil cp %s gs://%s/weights' % (f, opt.bucket)) if opt.bucket else None  # upload
+
+        # Plots
         if plots:
             plot_results(save_dir=save_dir)  # save as results.png
             if wandb:
@@ -421,6 +418,19 @@ def train(hyp, opt, device, tb_writer=None, wandb=None):
                 wandb.log({"Results": [wandb.Image(str(save_dir / f), caption=f) for f in files
                                        if (save_dir / f).exists()]})
         logger.info('%g epochs completed in %.3f hours.\n' % (epoch - start_epoch + 1, (time.time() - t0) / 3600))
+
+        # Test best.pt
+        if opt.data.endswith('coco.yaml') and nc == 80:  # if COCO
+            results, _, _ = test.test(opt.data,
+                                      batch_size=total_batch_size,
+                                      imgsz=imgsz_test,
+                                      model=attempt_load(best if best.exists() else last, device).half(),
+                                      single_cls=opt.single_cls,
+                                      dataloader=testloader,
+                                      save_dir=save_dir,
+                                      save_json=True,  # use pycocotools
+                                      plots=False)
+
     else:
         dist.destroy_process_group()
 
